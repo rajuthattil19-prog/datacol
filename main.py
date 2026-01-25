@@ -1,37 +1,47 @@
 import os
 import time
+import asyncio
+import threading
 from datetime import datetime
 
-from aiohttp import web
+from flask import Flask
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import PyMongoError
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram import Bot
+from telegram.constants import ParseMode
 
+# =========================
+# ENV
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN missing")
 if not MONGO_URI:
     raise RuntimeError("❌ MONGO_URI missing")
-if not RENDER_EXTERNAL_URL:
-    raise RuntimeError("❌ RENDER_EXTERNAL_URL missing (needed for webhook mode)")
+
+# =========================
+# Flask for /health
+# =========================
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "OK", 200
+
+@app.get("/health")
+def health():
+    return "OK", 200
 
 # =========================
 # Mongo
 # =========================
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["telegram_anti_fake"]
+
 messages_col = db["tg_messages"]
 userstats_col = db["tg_user_stats"]
 
@@ -39,14 +49,16 @@ messages_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING), ("ts"
 userstats_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
 # =========================
-# Bot Handlers
+# Telegram Bot (raw)
 # =========================
+bot = Bot(token=BOT_TOKEN)
+
 def safe_text(msg) -> str:
     if not msg:
         return ""
     return msg.text or msg.caption or ""
 
-async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_message_to_mongo(update):
     try:
         if not update.message:
             return
@@ -54,7 +66,9 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         user = update.effective_user
         msg = update.message
+
         ts = int(msg.date.timestamp()) if msg.date else int(time.time())
+        text = safe_text(msg)
 
         messages_col.insert_one({
             "chat_id": chat.id,
@@ -63,7 +77,7 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "full_name": (user.full_name or "").strip(),
             "ts": ts,
             "iso": datetime.utcfromtimestamp(ts).isoformat() + "Z",
-            "text": safe_text(msg),
+            "text": text,
             "msg_id": msg.message_id,
             "chat_type": chat.type,
         })
@@ -71,7 +85,11 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         userstats_col.update_one(
             {"chat_id": chat.id, "user_id": user.id},
             {
-                "$setOnInsert": {"chat_id": chat.id, "user_id": user.id, "first_seen": ts},
+                "$setOnInsert": {
+                    "chat_id": chat.id,
+                    "user_id": user.id,
+                    "first_seen": ts,
+                },
                 "$set": {
                     "username": user.username or "",
                     "full_name": (user.full_name or "").strip(),
@@ -83,100 +101,91 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except PyMongoError as e:
-        print(f"Mongo error: {e}")
+        print("Mongo error:", e)
     except Exception as e:
-        print(f"Error collecting: {e}")
+        print("Save error:", e)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Logger bot is running.\nUse /stats")
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+async def reply_stats(chat_id: int):
     total_msgs = messages_col.count_documents({})
+    total_chats = len(messages_col.distinct("chat_id"))
     total_users = len(userstats_col.distinct("user_id"))
+
     chat_msgs = messages_col.count_documents({"chat_id": chat_id})
     chat_users = userstats_col.count_documents({"chat_id": chat_id})
 
-    await update.message.reply_text(
-        f"📊 Stats\n\n"
-        f"🌍 Total users: {total_users}\n"
-        f"🌍 Total msgs: {total_msgs}\n\n"
+    text = (
+        "📊 Stats\n\n"
+        f"🌍 Chats tracked: {total_chats}\n"
+        f"🌍 Users tracked: {total_users}\n"
+        f"🌍 Messages stored: {total_msgs}\n\n"
         f"💬 This chat users: {chat_users}\n"
-        f"💬 This chat msgs: {chat_msgs}"
+        f"💬 This chat messages: {chat_msgs}"
     )
+    await bot.send_message(chat_id=chat_id, text=text)
 
 # =========================
-# Web Server Handlers
+# Manual Polling Loop (your blink style)
 # =========================
-async def health_check(request):
-    return web.Response(text="OK", status=200)
+async def poll_loop():
+    print("✅ Manual polling started...")
+    offset = None
 
-async def telegram_webhook(request):
-    bot_app: Application = request.app["bot_app"]
+    # IMPORTANT: remove webhook if exists (otherwise conflict)
     try:
-        data = await request.json()
-        update = Update.de_json(data, bot_app.bot)
-
-        # push update to PTB queue
-        await bot_app.update_queue.put(update)
-
-        return web.Response(text="Accepted", status=200)
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Webhook deleted (safe for polling)")
     except Exception as e:
-        print(f"Webhook error: {e}")
-        return web.Response(text="Error", status=500)
+        print("⚠️ delete_webhook failed:", e)
+
+    while True:
+        start_time = asyncio.get_event_loop().time()
+
+        # ON window ~1.2s
+        while asyncio.get_event_loop().time() - start_time < 1.2:
+            try:
+                updates = await asyncio.wait_for(
+                    bot.get_updates(offset=offset, timeout=5),
+                    timeout=6
+                )
+
+                if updates:
+                    offset = updates[-1].update_id + 1
+
+                    for upd in updates:
+                        # save every message
+                        await save_message_to_mongo(upd)
+
+                        # manual command detection
+                        if upd.message and upd.message.text:
+                            txt = upd.message.text.strip()
+
+                            if txt == "/stats":
+                                await reply_stats(upd.effective_chat.id)
+
+                            elif txt == "/start":
+                                await bot.send_message(
+                                    chat_id=upd.effective_chat.id,
+                                    text="✅ Logger bot running.\nUse /stats"
+                                )
+
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                print("Polling error:", e)
+
+        # OFF window
+        await asyncio.sleep(3)
+
+def start_polling_thread():
+    asyncio.run(poll_loop())
 
 # =========================
-# Startup / Cleanup
-# =========================
-async def on_startup(app):
-    bot_app: Application = app["bot_app"]
-
-    print("🚀 Starting Bot...")
-    await bot_app.initialize()
-    await bot_app.start()
-
-    # ✅ IMPORTANT: start PTB update processor (consumes update_queue)
-    await bot_app.updater.start_polling()
-
-    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-    print(f"🔗 Setting webhook: {webhook_url}")
-
-    await bot_app.bot.delete_webhook(drop_pending_updates=True)
-    await bot_app.bot.set_webhook(webhook_url)
-
-async def on_cleanup(app):
-    bot_app: Application = app["bot_app"]
-    print("🛑 Stopping Bot...")
-
-    try:
-        await bot_app.updater.stop()
-    except Exception:
-        pass
-
-    await bot_app.stop()
-    await bot_app.shutdown()
-
-# =========================
-# Main
+# Start everything
 # =========================
 if __name__ == "__main__":
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start_cmd))
-    bot_app.add_handler(CommandHandler("stats", stats_cmd))
-    bot_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_message))
+    threading.Thread(target=start_polling_thread, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)
 
-    web_app = web.Application()
-    web_app["bot_app"] = bot_app
-
-    web_app.router.add_get("/", health_check)
-    web_app.router.add_get("/health", health_check)
-    web_app.router.add_post("/webhook", telegram_webhook)
-
-    web_app.on_startup.append(on_startup)
-    web_app.on_cleanup.append(on_cleanup)
-
-    print(f"✅ Server running on port {PORT}")
-    web.run_app(web_app, port=PORT, host="0.0.0.0")
 
 
 
