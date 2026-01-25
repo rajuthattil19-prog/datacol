@@ -167,7 +167,12 @@ def health():
 def webhook():
     try:
         update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put_nowait(update)
+        # ✅ process update immediately (this triggers handlers)
+        asyncio.run_coroutine_threadsafe(
+            application.process_update(update),
+            application.bot_data["loop"]
+        )
+
         return "ok", 200
     except Exception as e:
         print("Webhook error:", e)
