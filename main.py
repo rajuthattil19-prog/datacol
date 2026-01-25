@@ -43,29 +43,26 @@ db = mongo_client["telegram_anti_fake"]
 
 messages_col = db["tg_messages"]
 userstats_col = db["tg_user_stats"]
-meta_col = db["tg_meta"]  # store offset + last_update_id
+meta_col = db["tg_meta"]  # store offset
 
 # Indexes
 messages_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING), ("ts", ASCENDING)])
 userstats_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
-# ✅ HARD dedupe index (prevents duplicate inserts)
-# same message_id in same chat should be unique
+# Hard dedupe index
 messages_col.create_index([("chat_id", ASCENDING), ("msg_id", ASCENDING)], unique=True)
 
 # =========================
-# Telegram Bot (raw)
+# Telegram Bot
 # =========================
 bot = Bot(token=BOT_TOKEN)
 
 # =========================
 # Offset persistence
 # =========================
-def get_offset() -> int | None:
+def get_offset():
     doc = meta_col.find_one({"_id": "poll_offset"})
-    if not doc:
-        return None
-    return doc.get("value")
+    return doc.get("value") if doc else None
 
 def set_offset(value: int):
     meta_col.update_one(
@@ -82,11 +79,11 @@ def safe_text(msg) -> str:
         return ""
     return msg.text or msg.caption or ""
 
+def is_group_chat(chat_type: str) -> bool:
+    return chat_type in ("group", "supergroup")
+
 async def save_message_to_mongo(update):
-    """
-    Saves 1 message per document.
-    Duplicates are automatically ignored using unique index (chat_id, msg_id).
-    """
+    """Save only group/supergroup messages"""
     try:
         if not update.message:
             return
@@ -94,6 +91,10 @@ async def save_message_to_mongo(update):
         chat = update.effective_chat
         user = update.effective_user
         msg = update.message
+
+        # ✅ Skip private messages from logging
+        if not is_group_chat(chat.type):
+            return
 
         ts = int(msg.date.timestamp()) if msg.date else int(time.time())
         text = safe_text(msg)
@@ -110,10 +111,8 @@ async def save_message_to_mongo(update):
             "chat_type": chat.type,
         }
 
-        # insert (will raise DuplicateKeyError if already exists)
         messages_col.insert_one(doc)
 
-        # update user stats
         userstats_col.update_one(
             {"chat_id": chat.id, "user_id": user.id},
             {
@@ -133,7 +132,6 @@ async def save_message_to_mongo(update):
         )
 
     except DuplicateKeyError:
-        # already saved, ignore
         return
     except PyMongoError as e:
         print("Mongo error:", e)
@@ -141,16 +139,18 @@ async def save_message_to_mongo(update):
         print("Save error:", e)
 
 async def reply_stats(chat_id: int):
+    # global only group stats
     total_msgs = messages_col.count_documents({})
     total_chats = len(messages_col.distinct("chat_id"))
     total_users = len(userstats_col.distinct("user_id"))
 
+    # this chat stats
     chat_msgs = messages_col.count_documents({"chat_id": chat_id})
     chat_users = userstats_col.count_documents({"chat_id": chat_id})
 
     text = (
-        "📊 Stats\n\n"
-        f"🌍 Chats tracked: {total_chats}\n"
+        "📊 Stats (Group Logs Only)\n\n"
+        f"🌍 Group chats tracked: {total_chats}\n"
         f"🌍 Users tracked: {total_users}\n"
         f"🌍 Messages stored: {total_msgs}\n\n"
         f"💬 This chat users: {chat_users}\n"
@@ -159,7 +159,7 @@ async def reply_stats(chat_id: int):
     await bot.send_message(chat_id=chat_id, text=text)
 
 # =========================
-# Manual Polling Loop (Blink style)
+# Polling Loop
 # =========================
 polling_started = False
 
@@ -172,11 +172,10 @@ async def poll_loop():
 
     print("✅ Manual polling started...")
 
-    # load saved offset so restart won't duplicate
     offset = get_offset()
     print("✅ Loaded offset from DB:", offset)
 
-    # IMPORTANT: remove webhook if exists (otherwise conflict)
+    # Remove webhook (safe for polling)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         print("✅ Webhook deleted (safe for polling)")
@@ -186,7 +185,6 @@ async def poll_loop():
     while True:
         start_time = asyncio.get_event_loop().time()
 
-        # ON window ~1.2s
         while asyncio.get_event_loop().time() - start_time < 1.2:
             try:
                 updates = await asyncio.wait_for(
@@ -195,33 +193,31 @@ async def poll_loop():
                 )
 
                 if updates:
-                    # move offset forward and persist
                     offset = updates[-1].update_id + 1
                     set_offset(offset)
 
                     for upd in updates:
-                        # Save every message (deduped by Mongo unique index)
-                        await save_message_to_mongo(upd)
-
-                        # manual command detection (dedupe reply using msg_id)
+                        # ✅ Always allow commands to reply (private + group)
                         if upd.message and upd.message.text:
                             txt = upd.message.text.strip()
 
-                            if txt == "/stats":
-                                await reply_stats(upd.effective_chat.id)
-
-                            elif txt == "/start":
+                            if txt == "/start":
                                 await bot.send_message(
                                     chat_id=upd.effective_chat.id,
-                                    text="✅ Logger bot running.\nUse /stats"
+                                    text="✅ Logger bot running.\nIt logs ONLY group messages.\nUse /stats"
                                 )
+
+                            elif txt == "/stats":
+                                await reply_stats(upd.effective_chat.id)
+
+                        # ✅ Save only group messages
+                        await save_message_to_mongo(upd)
 
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
                 print("Polling error:", e)
 
-        # OFF window
         await asyncio.sleep(3)
 
 def start_polling_thread():
@@ -233,10 +229,4 @@ def start_polling_thread():
 if __name__ == "__main__":
     threading.Thread(target=start_polling_thread, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, use_reloader=False)
-
-
-
-
-
-
 
