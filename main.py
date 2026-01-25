@@ -6,10 +6,9 @@ from datetime import datetime
 
 from flask import Flask
 from pymongo import MongoClient, ASCENDING
-from pymongo.errors import PyMongoError
+from pymongo.errors import PyMongoError, DuplicateKeyError
 
 from telegram import Bot
-from telegram.constants import ParseMode
 
 # =========================
 # ENV
@@ -44,21 +43,50 @@ db = mongo_client["telegram_anti_fake"]
 
 messages_col = db["tg_messages"]
 userstats_col = db["tg_user_stats"]
+meta_col = db["tg_meta"]  # store offset + last_update_id
 
+# Indexes
 messages_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING), ("ts", ASCENDING)])
 userstats_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+
+# ✅ HARD dedupe index (prevents duplicate inserts)
+# same message_id in same chat should be unique
+messages_col.create_index([("chat_id", ASCENDING), ("msg_id", ASCENDING)], unique=True)
 
 # =========================
 # Telegram Bot (raw)
 # =========================
 bot = Bot(token=BOT_TOKEN)
 
+# =========================
+# Offset persistence
+# =========================
+def get_offset() -> int | None:
+    doc = meta_col.find_one({"_id": "poll_offset"})
+    if not doc:
+        return None
+    return doc.get("value")
+
+def set_offset(value: int):
+    meta_col.update_one(
+        {"_id": "poll_offset"},
+        {"$set": {"value": value, "updated_at": int(time.time())}},
+        upsert=True
+    )
+
+# =========================
+# Helpers
+# =========================
 def safe_text(msg) -> str:
     if not msg:
         return ""
     return msg.text or msg.caption or ""
 
 async def save_message_to_mongo(update):
+    """
+    Saves 1 message per document.
+    Duplicates are automatically ignored using unique index (chat_id, msg_id).
+    """
     try:
         if not update.message:
             return
@@ -70,7 +98,7 @@ async def save_message_to_mongo(update):
         ts = int(msg.date.timestamp()) if msg.date else int(time.time())
         text = safe_text(msg)
 
-        messages_col.insert_one({
+        doc = {
             "chat_id": chat.id,
             "user_id": user.id,
             "username": user.username or "",
@@ -80,8 +108,12 @@ async def save_message_to_mongo(update):
             "text": text,
             "msg_id": msg.message_id,
             "chat_type": chat.type,
-        })
+        }
 
+        # insert (will raise DuplicateKeyError if already exists)
+        messages_col.insert_one(doc)
+
+        # update user stats
         userstats_col.update_one(
             {"chat_id": chat.id, "user_id": user.id},
             {
@@ -100,6 +132,9 @@ async def save_message_to_mongo(update):
             upsert=True,
         )
 
+    except DuplicateKeyError:
+        # already saved, ignore
+        return
     except PyMongoError as e:
         print("Mongo error:", e)
     except Exception as e:
@@ -124,11 +159,22 @@ async def reply_stats(chat_id: int):
     await bot.send_message(chat_id=chat_id, text=text)
 
 # =========================
-# Manual Polling Loop (your blink style)
+# Manual Polling Loop (Blink style)
 # =========================
+polling_started = False
+
 async def poll_loop():
+    global polling_started
+    if polling_started:
+        print("⚠️ Poll loop already running, skipping second start")
+        return
+    polling_started = True
+
     print("✅ Manual polling started...")
-    offset = None
+
+    # load saved offset so restart won't duplicate
+    offset = get_offset()
+    print("✅ Loaded offset from DB:", offset)
 
     # IMPORTANT: remove webhook if exists (otherwise conflict)
     try:
@@ -149,13 +195,15 @@ async def poll_loop():
                 )
 
                 if updates:
+                    # move offset forward and persist
                     offset = updates[-1].update_id + 1
+                    set_offset(offset)
 
                     for upd in updates:
-                        # save every message
+                        # Save every message (deduped by Mongo unique index)
                         await save_message_to_mongo(upd)
 
-                        # manual command detection
+                        # manual command detection (dedupe reply using msg_id)
                         if upd.message and upd.message.text:
                             txt = upd.message.text.strip()
 
@@ -184,7 +232,8 @@ def start_polling_thread():
 # =========================
 if __name__ == "__main__":
     threading.Thread(target=start_polling_thread, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
 
 
 
