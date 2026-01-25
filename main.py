@@ -21,13 +21,12 @@ from telegram.ext import (
     filters,
 )
 
-import secret  # Local file with secrets for testing
 
 # =========================
 # ENV
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", secret.botapi).strip()
-MONGO_URI = os.getenv("MONGO_URI", secret.mongo).strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
@@ -189,6 +188,14 @@ flask_app = Flask(__name__)
 def home():
     return "OK - Telegram Logger Bot Running", 200
 
+@flask_app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "telegram-logger-bot",
+        "mode": "webhook" if USE_WEBHOOK else "polling"
+    }, 200
+
 @flask_app.post("/webhook")
 def webhook():
     try:
@@ -223,3 +230,4 @@ if __name__ == "__main__":
         run_webhook()
     else:
         run_polling()
+
