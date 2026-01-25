@@ -4,11 +4,10 @@ import sys
 import asyncio
 from datetime import datetime
 
-# ✅ Fix for Windows + Python 3.13 + PTB polling event loop issues
+# ✅ Fix for Windows + Python 3.13 polling issues
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from flask import Flask, request
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import PyMongoError
 
@@ -21,7 +20,6 @@ from telegram.ext import (
     filters,
 )
 
-
 # =========================
 # ENV
 # =========================
@@ -32,9 +30,9 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN missing in environment variables")
+    raise RuntimeError("❌ BOT_TOKEN missing")
 if not MONGO_URI:
-    raise RuntimeError("❌ MONGO_URI missing in environment variables")
+    raise RuntimeError("❌ MONGO_URI missing")
 
 USE_WEBHOOK = bool(RENDER_EXTERNAL_URL)
 
@@ -52,7 +50,6 @@ db = mongo_client["telegram_anti_fake"]
 messages_col = db["tg_messages"]
 userstats_col = db["tg_user_stats"]
 
-# Indexes (safe to call multiple times)
 messages_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING), ("ts", ASCENDING)])
 messages_col.create_index([("chat_id", ASCENDING), ("ts", ASCENDING)])
 userstats_col.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
@@ -90,7 +87,6 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts = int(msg.date.timestamp()) if msg.date else int(time.time())
         text = safe_text(msg)
 
-        # Store raw message (1 document per message)
         messages_col.insert_one({
             "chat_id": chat_id,
             "user_id": user_id,
@@ -103,7 +99,6 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "chat_type": chat.type,
         })
 
-        # Update per-user stats (fast)
         userstats_col.update_one(
             {"chat_id": chat_id, "user_id": user_id},
             {
@@ -130,7 +125,6 @@ async def collect_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Logger bot is running.\n"
-        "I am collecting messages for analysis.\n\n"
         "Use /stats to see stored info."
     )
 
@@ -174,60 +168,25 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PTB Application
 # =========================
 application = Application.builder().token(BOT_TOKEN).build()
-
 application.add_handler(CommandHandler("start", start_cmd))
 application.add_handler(CommandHandler("stats", stats_cmd))
 application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_message))
 
 # =========================
-# Flask (Webhook)
+# Run
 # =========================
-flask_app = Flask(__name__)
-
-@flask_app.get("/")
-def home():
-    return "OK - Telegram Logger Bot Running", 200
-
-@flask_app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "telegram-logger-bot",
-        "mode": "webhook" if USE_WEBHOOK else "polling"
-    }, 200
-
-@flask_app.post("/webhook")
-def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put_nowait(update)
-        return "ok", 200
-    except Exception as e:
-        print("Webhook error:", e)
-        return "error", 500
-
-# =========================
-# Run modes
-# =========================
-def run_polling():
-    # ⚠️ If webhook was set before, polling may not work until webhook is deleted.
-    application.run_polling(drop_pending_updates=True, close_loop=False)
-
-def run_webhook():
-    async def set_hook():
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        await application.bot.set_webhook(webhook_url)
-        print("✅ Webhook set:", webhook_url)
-
-    application.initialize()
-    application.start()
-    application.create_task(set_hook())
-
-    flask_app.run(host="0.0.0.0", port=PORT)
-
 if __name__ == "__main__":
     if USE_WEBHOOK:
-        run_webhook()
+        # ✅ Proper webhook runner (no Flask needed)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"{RENDER_EXTERNAL_URL}/webhook",
+            drop_pending_updates=True,
+        )
     else:
-        run_polling()
+        # ✅ Local testing
+        application.run_polling(drop_pending_updates=True, close_loop=False)
+
 
