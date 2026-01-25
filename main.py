@@ -181,6 +181,9 @@ async def run_webhook_mode():
     await application.initialize()
     await application.start()
 
+    await application.updater.start_polling()
+
+
     # Set webhook URL
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
     await application.bot.delete_webhook(drop_pending_updates=True)
