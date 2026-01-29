@@ -79,6 +79,16 @@ def safe_text(msg) -> str:
         return ""
     return msg.text or msg.caption or ""
 
+def is_service_message(msg) -> bool:
+    return bool(
+        msg.new_chat_members or
+        msg.left_chat_member or
+        msg.pinned_message or
+        msg.group_chat_created or
+        msg.supergroup_chat_created or
+        msg.channel_chat_created
+    )
+
 def is_group_chat(chat_type: str) -> bool:
     return chat_type in ("group", "supergroup")
 
@@ -91,6 +101,9 @@ async def save_message_to_mongo(update):
         chat = update.effective_chat
         user = update.effective_user
         msg = update.message
+
+        if is_service_message(msg):
+            return
 
         # ✅ Skip private messages from logging
         if not is_group_chat(chat.type):
